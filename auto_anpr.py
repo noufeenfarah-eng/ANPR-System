@@ -2,10 +2,12 @@ import cv2
 import sys
 import os
 import re
+from collections import Counter
 import time
 import csv
 from ultralytics import YOLO
 import easyocr
+import numpy as np
 
 # -----------------------------
 # LOAD MODELS
@@ -13,30 +15,100 @@ import easyocr
 model = YOLO("models/license_plate_detector.pt")
 reader = easyocr.Reader(['en'])
 
+plate_buffer = []
 # -----------------------------
 # CLEAN FUNCTION
 # -----------------------------
+
 def clean_plate(text):
+    import re
+
+    # Clean OCR text
     text = text.upper()
+    text = text.replace("IND", "")
     text = text.replace(" ", "")
     text = re.sub(r"[^A-Z0-9]", "", text)
 
-    # Fix common OCR errors
-    replacements = {
+    if len(text) < 6:
+        return text
+
+    chars = list(text)
+
+    # Safe OCR corrections
+    digit_like = {
         "O": "0",
-        "C": "0",
+        "Q": "0",
+        "D": "0",
         "I": "1",
+        "L": "1",
         "Z": "2",
-        "S": "5",
-        "B": "8"
+        "S": "5"
     }
 
-    fixed = ""
-    for ch in text:
-        fixed += replacements.get(ch, ch)
+    letter_like = {
+        "0": "O",
+        "1": "I",
+        "2": "Z",
+        "8": "B"
+    }
 
-    return fixed
+    # -------- BH SERIES --------
+    # Example: 22BH6517A
+    bh_pattern = re.match(r"^\d{2}[A-Z]{2}", text)
 
+    if bh_pattern:
+        # First 2 must be digits
+        for i in range(min(2, len(chars))):
+            chars[i] = digit_like.get(chars[i], chars[i])
+
+        # BH letters
+        for i in range(2, min(4, len(chars))):
+            chars[i] = letter_like.get(chars[i], chars[i])
+
+        # Remaining characters untouched
+        result = "".join(chars)
+
+    # -------- NORMAL INDIAN --------
+    # Example: RJ14CV0002
+    else:
+        # First 2 should be letters
+        for i in range(min(2, len(chars))):
+            chars[i] = letter_like.get(chars[i], chars[i])
+
+        # Next 2 should be district digits
+        for i in range(2, min(4, len(chars))):
+
+            if chars[i] == "I":
+                chars[i] = "1"
+
+            elif chars[i] == "L":
+                chars[i] = "4"
+
+            elif chars[i] == "Z":
+                # OCR often reads 4 as Z
+                if i == 3:
+                    chars[i] = "4"
+                else:
+                    chars[i] = "2"
+
+            else:
+                chars[i] = digit_like.get(chars[i], chars[i])        # Middle letters section
+        middle_end = max(len(chars) - 4, 4)
+
+        for i in range(4, middle_end):
+            chars[i] = letter_like.get(chars[i], chars[i])
+
+        # Last 4 should be digits
+        for i in range(max(len(chars) - 4, 0), len(chars)):
+            chars[i] = digit_like.get(chars[i], chars[i])
+
+        result = "".join(chars)
+
+    # Remove random long noisy outputs
+    if len(result) > 10:
+        result = result[:10]
+
+    return result
 # -----------------------------
 # SAVE TO CSV
 # -----------------------------
@@ -61,16 +133,50 @@ def process_frame(frame, source="image"):
     for box in results[0].boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
 
+        pad = 10
+
+        h, w = frame.shape[:2]
+
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(w, x2 + pad)
+        y2 = min(h, y2 + pad)
+
         plate = frame[y1:y2, x1:x2]
+
+        cv2.imwrite("debug_plate.jpg", plate)
 
         if plate.size == 0:
             continue
 
         # Improve OCR
-        plate = cv2.resize(plate, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        plate = cv2.GaussianBlur(plate, (3, 3), 0)
+        gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
 
-        text_list = reader.readtext(plate, detail=0, paragraph=True)
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=3,
+            fy=3,
+            interpolation=cv2.INTER_CUBIC
+        )
+
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+        gray = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
+
+        text_list = reader.readtext(
+            gray,
+            detail=0,
+            paragraph=False,
+            decoder='beamsearch',
+            width_ths=0.7,
+            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        )
 
         for text in text_list:
             raw_text = text.upper()
@@ -79,19 +185,68 @@ def process_frame(frame, source="image"):
             if any(j in raw_text for j in junk):
                 continue
 
+            
             clean_text = clean_plate(raw_text)
 
+            # Reject incomplete OCR
+            if len(clean_text) < 8:
+                continue
+
+            # Validate Indian plate start
+            if (
+                len(clean_text) >= 2
+                and not (
+                    clean_text[:2].isalpha()
+                    or clean_text[:2].isdigit()  # BH series
+                )
+            ):
+                continue
+
             if 8 <= len(clean_text) <= 12:
+                # Add to buffer
+                plate_buffer.append(clean_text)
+
+                # Keep last 10 readings
+                if len(plate_buffer) > 10:
+                    plate_buffer.pop(0)
+
+                # Most common plate
+                stable_plate = Counter(
+                    plate_buffer
+                ).most_common(1)[0][0]
+
                 print("\nRAW:", raw_text)
-                print("PLATE:", clean_text)
+                print("PLATE:", stable_plate)
 
-                detected_plates.append(clean_text)
-                save_to_csv(clean_text, source)
+                detected_plates.append(stable_plate)
+                save_to_csv(stable_plate, source)
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2
+        )
+
+        # Show stable plate on webcam
+        if len(plate_buffer) > 0:
+
+            stable_plate = Counter(
+                plate_buffer
+            ).most_common(1)[0][0]
+
+            cv2.putText(
+                frame,
+                stable_plate,
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2
+            )
 
     return frame, detected_plates
-
 # -----------------------------
 # MODE 1: IMAGE
 # -----------------------------
