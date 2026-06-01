@@ -1,3 +1,7 @@
+import sqlite3
+import os
+import time
+from datetime import datetime
 import cv2
 import sys
 import os
@@ -12,9 +16,44 @@ import numpy as np
 # -----------------------------
 # LOAD MODELS
 # -----------------------------
+
 model = YOLO("models/license_plate_detector.pt")
 reader = easyocr.Reader(['en'])
 
+# Create folder for saved detections
+SAVE_FOLDER = "detected_vehicles"
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# Prevent duplicate saves
+COOLDOWN = 10
+
+plate_buffer = []
+last_seen = {}
+# Confirm plate before saving
+plate_counts = {}
+MIN_DETECTIONS = 3
+plate_buffer = []
+COOLDOWN = 10
+# -----------------------------
+# DATABASE
+# -----------------------------
+conn = sqlite3.connect(
+    "vehicles.db"
+)
+
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS detections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plate TEXT,
+    timestamp TEXT,
+    source TEXT,
+    image_path TEXT
+)
+""")
+
+conn.commit()
 plate_buffer = []
 # -----------------------------
 # CLEAN FUNCTION
@@ -217,10 +256,107 @@ def process_frame(frame, source="image"):
 
                 print("\nRAW:", raw_text)
                 print("PLATE:", stable_plate)
+                current_time = time.time()
 
-                detected_plates.append(stable_plate)
-                save_to_csv(stable_plate, source)
+                # Count detections
+                if stable_plate not in plate_counts:
+                    plate_counts[
+                        stable_plate
+                    ] = 1
+                else:
+                    plate_counts[
+                        stable_plate
+                    ] += 1
 
+                # Save only after
+                # 3 confirmations
+                if (
+                    plate_counts[
+                        stable_plate
+                    ] >= MIN_DETECTIONS
+                ):
+
+                    if (
+                        stable_plate
+                        not in last_seen
+                        or current_time -
+                        last_seen[
+                            stable_plate
+                        ]
+                        > COOLDOWN
+                    ):
+
+                        last_seen[
+                            stable_plate
+                        ] = current_time
+
+                        detected_plates.append(
+                            stable_plate
+                        )
+
+                        save_to_csv(
+                            stable_plate,
+                            source
+                        )
+
+                        # Save image
+                        timestamp = datetime.now(
+                        ).strftime(
+                            "%Y-%m-%d_%H-%M-%S"
+                        )
+
+                        filename = (
+                            f"{stable_plate}_"
+                            f"{timestamp}.jpg"
+                        )
+
+                        filepath = os.path.join(
+                            SAVE_FOLDER,
+                            filename
+                        )
+
+                        vehicle_crop = frame[
+                            y1:y2,
+                            x1:x2
+                        ]
+
+                        if vehicle_crop.size > 0:
+                            cv2.imwrite(
+                                filepath,
+                                vehicle_crop
+                            )
+
+                        print(
+                            f"SAVED: {filepath}"
+                        )
+
+                        # Save to database
+                        timestamp_db = datetime.now(
+                        ).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+
+                        cursor.execute("""
+                        INSERT INTO detections
+                        (
+                            plate,
+                            timestamp,
+                            source,
+                            image_path
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """, (
+                            stable_plate,
+                            timestamp_db,
+                            source,
+                            filepath
+                        ))
+
+                        conn.commit()
+
+                        print(
+                            "Saved to database"
+                        )
         cv2.rectangle(
             frame,
             (x1, y1),
